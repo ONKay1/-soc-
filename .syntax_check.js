@@ -1,0 +1,207 @@
+
+(() => {
+  let rows = [], active = -1, selectedThreatTypes = new Set(), realAttackThreats = new Set();
+  const $ = id => document.getElementById(id);
+  const aliases = { threatType:['rule_category_name','rulecategoryname','rule_category','rulecategory','threat_type','threattype','attack_type','attacktype','category','event_type','eventtype','ioc_type','ioctype','威胁类型','威胁类别','规则分类'], alertName:['alert_name','alarm_name','alert','alarm','event_name','eventtype','event_type','rule_name','rulename','name','title','告警名称','告警名','标题'], srcIp:['src_ip','source_ip','sourceip','sip','client_ip','clientip','remote_addr','remote_ip','srcip','attacker_content','attackercontent','attacker','源ip','源_ip','攻击者'], srcPort:['src_port','source_port','sourceport','sport','client_port','源端口'], dstIp:['dst_ip','dest_ip','destination_ip','dstip','dip','server_ip','victim_content','victimcontent','victim','目的ip','目的_ip','受害者'], dstPort:['dst_port','dest_port','destination_port','dport','server_port','目的端口'], method:['method','http_method','httpmethod','httpmethod','请求方法'], host:['host','http_host','httphost','domain','域名'], uri:['uri','url','path','request_uri','requesturi','uripath','uri_path','请求uri'], reqHeaders:['request_headers','req_headers','http_request_headers','http_req_header','httpreqheader','request_header','请求头'], reqBody:['request_body','req_body','http_request_body','http_req_body','httpreqbody','http_parameter','httpparameter','up_payload','uppayload','upstream_payload','upstreampayload','send_payload','sendpayload','request_data','requestdata','payload','body','sql','request_params','request_parameters','参数','请求体','http参数','sql参数'], status:['status','status_code','response_status','http_rsp_code','httprspcode','http_status','httpstatus','响应状态','响应码'], resHeaders:['response_headers','res_headers','http_response_headers','http_rsp_header','httprspheader','response_header','响应头'], request:['request','raw_request','http_request','raw_http_request','原始请求'], response:['response','raw_response','http_response','raw_http_response','原始响应'], time:['timestamp','time','datetime','latesttimestamp','occur_time','occurtime','event_time','eventtime','告警时间','时间'] };
+  const norm = v => String(v ?? '').trim();
+  const repairMojibake = value => { const text=norm(value); if(!text) return text; const badness=s=>(s.match(/�/g)||[]).length*8+(s.match(/[\u0080-\u00ff]/g)||[]).length+(s.match(/[娉浠浼娴侀噺劅鍣]/g)||[]).length*2; let best=text,bestScore=badness(text); try { let candidate=text; for(let i=0;i<2;i++){ const bytes=Uint8Array.from([...candidate], c=>c.charCodeAt(0)&255); candidate=new TextDecoder('utf-8').decode(bytes); const score=badness(candidate); if(score<bestScore){best=candidate;bestScore=score;} else break; } } catch {} try { let candidate=text; for(let i=0;i<2;i++){ const bytes=Uint8Array.from([...candidate], c=>c.charCodeAt(0)&255); candidate=new TextDecoder('gb18030').decode(bytes); const score=badness(candidate); if(score<bestScore){best=candidate;bestScore=score;} else break; } } catch {} return best; };
+  const keyMap = o => { const m={}; Object.keys(o).forEach(k=>m[k.toLowerCase().replace(/[\s\-]/g,'_')]=o[k]); return m; };
+  const get = (o, names) => { const m=keyMap(o); for(const n of names) if(m[n] !== undefined && norm(m[n])) return norm(m[n]); return ''; };
+  const unquote = s => { s=norm(s); if(s.length>1 && s[0]=='"' && s.at(-1)=='"') return s.slice(1,-1).replace(/""/g,'"'); return s; };
+  function readableScore(text){ const v=String(text||''); if(!v) return -9999; const printable=(v.match(/[\u0009\u000a\u000d\u0020-\u007e\u4e00-\u9fff]/g)||[]).length; const controls=(v.match(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffd]/g)||[]).length; return printable/v.length*100-controls*4; }
+  function decodeBase64Payload(value){
+    try {
+      const raw=atob(String(value).replace(/\s/g,''));
+      const bytes=Uint8Array.from(raw,c=>c.charCodeAt(0));
+      const candidates=[];
+      for(const charset of ['utf-8','utf-16le','gb18030']){
+        try { candidates.push(new TextDecoder(charset,{fatal:true}).decode(bytes)); } catch {}
+        try { candidates.push(new TextDecoder(charset).decode(bytes)); } catch {}
+      }
+      return candidates.sort((a,b)=>readableScore(b)-readableScore(a))[0]||'';
+    } catch { return ''; }
+  }
+  const maybeDecodeBase64 = value => { const text=norm(value); if(!text || text.length<16 || text.length%4!==0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(text)) return ''; const decoded=decodeBase64Payload(text); return readableScore(decoded)>45 ? decoded.replace(/\u0000/g,'') : ''; };
+  const isAbsoluteUrl = value => /^https?:\/\//i.test(norm(value));
+  function parseCSV(text){
+    const out=[]; let row=[], cell='', quoted=false;
+    for(let i=0;i<text.length;i++){ const c=text[i], n=text[i+1]; if(c==='"'){ if(quoted&&n==='"'){cell+='"';i++;} else quoted=!quoted; } else if(c===','&&!quoted){row.push(cell);cell='';} else if((c==='\n'||c==='\r')&&!quoted){ if(c==='\r'&&n==='\n') i++; row.push(cell); if(row.some(x=>x.trim())) out.push(row); row=[];cell=''; } else cell+=c; }
+    row.push(cell); if(row.some(x=>x.trim())) out.push(row); const headers=(out.shift()||[]).map(h=>h.trim()); return out.map(r=>Object.fromEntries(headers.map((h,i)=>[h,repairMojibake(r[i]||'')])));
+  }
+  async function readCsvFile(file){
+    const buffer=await file.arrayBuffer();
+    const utf8=new TextDecoder('utf-8').decode(buffer); const gb18030=new TextDecoder('gb18030').decode(buffer);
+    const badness=text=>(text.match(/�/g)||[]).length*8+(text.match(/[\u0080-\u00ff]/g)||[]).length+(text.match(/[娉浠浼娴侀噺劅鍣]/g)||[]).length*2;
+    return parseCSV(badness(gb18030)<badness(utf8)?gb18030:utf8);
+  }
+  function parseRaw(raw, isRequest){
+    raw=unquote(raw).replace(/\\r\\n/g,'\r\n').replace(/\\n/g,'\n');
+    if(!raw) return {start:'',headers:'',body:''};
+    const lines=raw.split(/\r?\n/); const start=lines.shift()||'';
+    let boundary=lines.findIndex(line=>!line.trim());
+    if(boundary<0 && isRequest){
+      const lastHeader=lines.reduce((last,line,i)=>/^[-A-Za-z0-9_]+\s*:/i.test(line)?i:last,-1);
+      if(lastHeader>=0 && lastHeader<lines.length-1) boundary=lastHeader+1;
+    }
+    const headerLines=boundary<0?lines:lines.slice(0,boundary);
+    const bodyLines=boundary<0?[]:lines.slice(boundary+1);
+    return {start,headers:headerLines.join('\r\n'),body:bodyLines.join('\n')};
+  }
+  function normalizeForDetection(value){ let text=String(value||''); for(let i=0;i<2;i++){ try { const decoded=decodeURIComponent(text.replace(/\+/g,'%20')); if(decoded===text) break; text=decoded; } catch { break; } } text=text.replace(/\\x([0-9a-f]{2})/ig,(_,h)=>String.fromCharCode(parseInt(h,16))).replace(/\\u([0-9a-f]{4})/ig,(_,h)=>String.fromCharCode(parseInt(h,16))); const candidates=text.match(/[A-Za-z0-9+/]{16,}={0,2}/g)||[]; candidates.forEach(item=>{const decoded=maybeDecodeBase64(item); if(decoded) text+=`\n${decoded}`;}); return text; }
+  function isSqlInjection(text){
+    const v=String(text||'').toLowerCase();
+    const businessSqlConsole=/(?:userparam=|ccjdbc=|istransaction=|sqlexc=|name=)/i.test(v) && /(?:执行sql语句|临时视图|cleanup|_local|create\s+table|drop\s+table)/i.test(v);
+    if(businessSqlConsole) return false;
+    const hasAttackPrimitive=/(?:\bunion(?:\s+all)?\s+select\b|\bor\s+[\"']?\d+[\"']?\s*=\s*[\"']?\d+|\band\s+[\"']?\d+[\"']?\s*=\s*[\"']?\d+|--(?:\s|$)|\/\*|\b(?:sleep|benchmark|waitfor)\s*\(|\bdrop\s+(?:table|database)\b|\binformation_schema\b|\bload_file\s*\(|\binto\s+outfile\b)/i.test(v);
+    if(!hasAttackPrimitive) return false;
+    const dbAuditContext=/(?:\binstance_name\s*=|\bdb_name\s*=|\bschema_name\s*=|\btb_name\s*=|\bsql_content\s*=)/i.test(v);
+    const isBusinessQuery=/\bsql_content\s*=\s*(?:select|with)\b/i.test(v) && /\binstance_name\s*=\s*[^&\s]+/i.test(v) && /\b(?:db_name|tb_name)\s*=/i.test(v);
+    return !(dbAuditContext && isBusinessQuery);
+  }
+  function normalize(o){
+    let request=parseRaw(get(o,aliases.request),true), response=parseRaw(get(o,aliases.response),false);
+    const appProtocol=get(o,['app_protocol','appprotocol','application_protocol','applicationprotocol','protocol','app_name','appname','应用协议','应用名称']);
+    const httpMethod=get(o,aliases.method)||request.start.split(' ')[0]||'';
+    const isHttp=/^(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE)$/i.test(httpMethod)||/^HTTP\//i.test(request.start)||/https?|web|http/i.test(appProtocol);
+    const method=httpMethod||(isHttp?'GET':(appProtocol||'原始流量'));
+    const rawUrl=get(o,['url','full_url','fullurl','request_url','requesturl','uri','path','uri_path']); const uri=get(o,aliases.uri)||request.start.split(' ')[1]||(isHttp?'/':'-'); const host=get(o,aliases.host)||((request.headers.match(/^host:\s*(.+)$/im)||[])[1]||'');
+    let fullUrl=''; try { fullUrl=isAbsoluteUrl(rawUrl)?rawUrl:(host&&uri?`http://${host}${uri.startsWith('/')?'':'/'}${uri}`:''); } catch { fullUrl=''; }
+    const embeddedPairText=`${get(o,['attacker_content','attackerContent','attacker'])} ${get(o,['victim_content','victimContent','victim'])}`;
+    const rawOccurTime=get(o,aliases.time); const occurredAt=/^\d{13}$/.test(rawOccurTime)?new Date(Number(rawOccurTime)).toLocaleString('zh-CN',{hour12:false}):rawOccurTime;
+    const status=get(o,aliases.status)||((response.start.match(/\s(\d{3})\b/)||[])[1]||'');
+    const rawReqHeader=get(o,aliases.reqHeaders);
+    const rawResHeader=get(o,aliases.resHeaders);
+    const reqH=rawReqHeader||request.headers;
+    const rawUpPayload=get(o,['up_payload','uppayload','upstream_payload','upstreampayload','send_payload','sendpayload','request_payload','requestpayload','payload_up','payloadup','上行载荷','上行数据']);
+    const rawBody=get(o,aliases.reqBody)||request.body||rawUpPayload;
+    const rawResponseBody=get(o,['response_body','res_body','http_rsp_body','httprspbody','down_payload','downpayload','downstream_payload','downstreampayload','receive_payload','receivepayload','response_payload','responsepayload','payload_down','payloaddown','响应体','下行载荷','下行数据'])||response.body;
+    const fallbackParams=get(o,['sql_content','sqlcontent','query','query_string','querystring','http_parameter','httpparameter','content','内容','攻击内容','attacker_content']);
+    const reqB=rawBody||fallbackParams||((method === 'GET' && uri.includes('?')) ? uri.slice(uri.indexOf('?') + 1) : '');
+    const pairIps=embeddedPairText.match(/(?:\d{1,3}\.){3}\d{1,3}/g)||[];
+    const srcIp=get(o,aliases.srcIp)||pairIps[0]||'-';
+    const dstIp=get(o,aliases.dstIp)||pairIps[1]||'-';
+    const normalizedBody=reqB.replace(/%26/g,'&');
+    const resH=rawResHeader||response.headers;
+    const alertName=repairMojibake(get(o,aliases.alertName))||'-';
+    const threatType=repairMojibake(get(o,aliases.threatType))||'-';
+    const occurDays=get(o,['occur_days','occurdays','alert_days','告警出现天数','出现天数'])||'-';
+    const isSqlAlert=/sql\s*(?:injection|注入)|sql注入/i.test(threatType);
+    const sqli=isSqlAlert && isSqlInjection(`${method} ${uri}\n${reqH}\n${reqB}`);
+    return { alertName, threatType, occurDays, attackResult:get(o,['attack_result','attackresult','攻击结果'])||'-', triageResult:get(o,['triage_result','triageresult','研判结果'])||'-', triageReason:get(o,['triage_reason','triagereason','研判原因'])||'-', alarmDescription:get(o,['alarm_desc','alarmdesc','告警描述'])||'-', solution:get(o,['solution','处置建议'])||'-', isSqlAlert, srcIp, srcPort:get(o,aliases.srcPort)||'-', dstIp, dstPort:get(o,aliases.dstPort)||'-', time:occurredAt||'-', appProtocol, isHttp, method, host, uri, fullUrl, status:status||'-', requestHeader:reqH, requestBody:normalizedBody, responseHeader:resH, responseBody:rawResponseBody, sqli };
+  }
+  const e = s => String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  function evidenceHtml(value, r){
+    const plain=String(value||''); const triage=threatTriage(r); if(!triage.real) return e(plain);
+    const type=norm(r.threatType); let patterns=null;
+    if(r.isSqlAlert) patterns=/(\bunion(?:\s+all)?\s+select\b|\bor\s+[\"']?\d+[\"']?\s*=\s*[\"']?\d+|\band\s+[\"']?\d+[\"']?\s*=\s*[\"']?\d+|--(?:\s|$)|\/\*|\b(?:sleep|benchmark|waitfor)\s*\(|\bdrop\s+(?:table|database)\b|\binformation_schema\b|\bload_file\s*\(|\binto\s+outfile\b)/ig;
+    else if(/文件上传|webshell/i.test(type)) patterns=/(multipart\/form-data|filename=|\.php\b|\.jsp\b|\.aspx\b|\.war\b)/ig;
+    else if(/命令执行|代码执行/i.test(type)) patterns=/(cmd\.exe|powershell|\/bin\/(?:sh|bash)|\bwhoami\b|\bcurl\b|\bwget\b|\beval\s*\()/ig;
+    else if(/目录遍历/i.test(type)) patterns=/(\/(?:etc\/(?:passwd|shadow|hosts|issue|ssh\/sshd_config)|proc\/(?:self\/(?:environ|cmdline|status)|version)|var\/(?:log|www|backup)|root(?:\/|$)|home(?:\/|$)|usr\/(?:bin|sbin|local)|opt(?:\/|$)|tmp(?:\/|$)|windows\/(?:win\.ini|system32|system\.ini|repair)|winnt\/(?:system32|win\.ini)|inetpub(?:\/|$)|programdata(?:\/|$))|(?:^|\/)\.(?:env|git|svn|htaccess|htpasswd|aws|ssh|bash_history)(?:\/|$)|web\.config\b|(?:^|\/)(?:config|configs|backup|backups|admin|administrator|manage|console|actuator|swagger-ui|api-docs)(?:\/|$))/ig;
+    else if(/跨站脚本|xss/i.test(type)) patterns=/(<script\b|javascript:|onerror\s*=|onload\s*=)/ig;
+    else if(/漏洞利用|非授权访问|权限绕过/i.test(type)) patterns=/(\/admin\b|\/actuator\b|\/\.env\b|\/config\b|token=)/ig;
+    if(!patterns) return e(plain); let out='',last=0,match; while((match=patterns.exec(plain))){ out+=e(plain.slice(last,match.index))+`<mark class="evidence">${e(match[0])}</mark>`; last=match.index+match[0].length; } return out?out+e(plain.slice(last)):e(plain);
+  }
+  function reqText(r){ return r.isHttp ? `${r.method} ${r.uri} HTTP/1.1${r.requestHeader?`\r\n${r.requestHeader}`:''}` : (r.requestHeader||`非 HTTP 流量（${r.appProtocol||r.method||'未知协议'}）`); }
+  function requestHeaderLabel(r){ return '请求头'; }
+  function requestBodyLabel(r){ return r.isHttp && r.requestBody && r.method === 'GET' && r.uri.includes('?') ? '请求参数（GET Query）' : '请求体'; }
+  function responseBodyLabel(r){ return '响应体'; }
+  function isBinaryPayload(value){
+    const text=String(value||''); if(!text) return false;
+    const controls=(text.match(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g)||[]).length;
+    const replacement=(text.match(/�/g)||[]).length;
+    return /^PK[\u0003\u0005\u0007]/.test(text)||controls>Math.max(4,text.length*.015)||replacement>Math.max(5,text.length*.03);
+  }
+  function binaryPayloadView(value){
+    const text=String(value||'');
+    const zip=/^PK[\u0003\u0005\u0007]/.test(text)||/PK[\u0001\u0003\u0005\u0006]/.test(text);
+    const paths=[...new Set((text.match(/[A-Za-z0-9_.$/\\-]+\.(?:class|jar|zip|war|prp|xml|properties|txt|html|js|css)/gi)||[]))].slice(0,50);
+    const bytes=[];
+    for(const ch of text){ const code=ch.codePointAt(0); if(code<=255) bytes.push(code); else { const encoded=new TextEncoder().encode(ch); bytes.push(...encoded); } }
+    const lines=[];
+    for(let offset=0;offset<bytes.length;offset+=16){
+      const chunk=bytes.slice(offset,offset+16);
+      const hex=chunk.map(b=>b.toString(16).toUpperCase().padStart(2,'0')).join(' ').padEnd(47,' ');
+      const ascii=chunk.map(b=>b>=32&&b<=126?String.fromCharCode(b):'.').join('');
+      lines.push(`${offset.toString(16).toUpperCase().padStart(8,'0')}  ${hex}  |${ascii}|`);
+    }
+    return `[二进制${zip?' ZIP/JAR':'文件'}原始内容：十六进制 + ASCII 视图，共 ${bytes.length} 字节]\n${lines.join('\n')}${paths.length?`\n\n可识别文件条目：\n${paths.join('\n')}`:''}`;
+  }
+  function displayedPayload(value){
+    const raw=String(value||'');
+    const decoded=$('decodeBase64').checked ? maybeDecodeBase64(raw) : '';
+    return decoded ? `${decoded}\n\n[原始 Base64]\n${raw}` : raw;
+  }
+  function displayedRequestBody(r){ return displayedPayload(r.requestBody); }
+  function resText(r){ return r.status === '-' ? '-' : String(r.status); }
+  function responseCodeClass(status){ const code=Number(status); return code>=400&&code<500 ? 'status-4xx' : code>=200&&code<300 ? 'status-2xx' : ''; }
+  function tag(r){ const n=Number(r.status); return `<span class="tag ${n>=400&&n<500?'err':n>=500?'warn':'ok'}">${e(r.status)}</span>`; }
+  function threatTriage(r){
+    const type=norm(r.threatType); const payload=normalizeForDetection(`${r.method} ${r.uri}\n${r.requestHeader}\n${r.requestBody}`).toLowerCase();
+    if(/非自身业务|外连失败|解析失败|建议不关注|白名单/i.test(`${r.triageResult} ${r.triageReason}`)) return {enabled:true,real:false,result:'非真实攻击：研判结果表明该告警无需关注或攻击链路未成功'};
+    const selected=selectedThreatTypes.has(type);
+    if(r.isSqlAlert){
+      const businessSqlConsole=/(?:userparam=|ccjdbc=|istransaction=|sqlexc=|name=)/i.test(payload) && /(?:执行sql语句|临时视图|cleanup|_local|create\s+table|drop\s+table)/i.test(payload);
+      if(businessSqlConsole) return {enabled:true,real:false,result:'非真实攻击：识别为业务 SQL 控制台/临时视图维护操作'};
+      return r.sqli ? {enabled:true,real:true,result:'真实攻击：命中 SQL 注入特征'} : {enabled:true,real:false,result:'非真实攻击：未命中当前 SQL 注入特征规则'};
+    }
+    const confirmed=/^(成功|已确认|true|yes|真实攻击)$/i.test(norm(r.attackResult));
+    const blocked=/^(失败|阻断|已拦截|false|no|非真实攻击)$/i.test(norm(r.attackResult));
+    if(blocked) return {enabled:true,real:false,result:'非真实攻击：告警结果显示请求已失败、阻断或拦截'};
+    const patterns=[
+      [/文件上传|webshell/i,/(?:multipart\/form-data|filename=|\.php\b|\.jsp\b|\.aspx\b|\.war\b)/,'文件上传行为特征'],
+      [/命令执行|代码执行/i,/(?:cmd\.exe|powershell|\/bin\/(?:sh|bash)|\bwhoami\b|\bcurl\b|\bwget\b|\beval\s*\()/,'命令/代码执行特征'],
+      [/目录遍历/i,/(?:\/(?:etc\/(?:passwd|shadow|hosts|issue|ssh\/sshd_config)|proc\/(?:self\/(?:environ|cmdline|status)|version)|var\/(?:log|www|backup)|root(?:\/|$)|home(?:\/|$)|usr\/(?:bin|sbin|local)|opt(?:\/|$)|tmp(?:\/|$)|windows\/(?:win\.ini|system32|system\.ini|repair)|winnt\/(?:system32|win\.ini)|inetpub(?:\/|$)|programdata(?:\/|$))|(?:^|\/)\.(?:env|git|svn|htaccess|htpasswd|aws|ssh|bash_history)(?:\/|$)|web\.config\b|(?:^|\/)(?:config|configs|backup|backups|admin|administrator|manage|console|actuator|swagger-ui|api-docs)(?:\/|$))/i,'敏感目录/文件访问特征'],
+      [/跨站脚本|xss/i,/(?:<script\b|javascript:|onerror\s*=|onload\s*=)/,'跨站脚本特征'],
+      [/弱口令|暴力猜解/i,/(?:login|password|passwd|auth)/,'认证尝试特征'],
+      [/漏洞利用|非授权访问|权限绕过/i,/(?:\/admin\b|\/actuator\b|\/\.env\b|\/config\b|token=)/,'漏洞利用/越权访问特征']
+    ];
+    const match=patterns.find(([typePattern])=>typePattern.test(type));
+    if(match){ const evidenceMatched=match[1].test(payload); const real=confirmed&&evidenceMatched; return {enabled:true,real,result:real?`真实攻击：命中${match[2]}`:(!norm(r.requestBody)?'待确认：缺少可验证的 HTTP 请求载荷证据':`非真实攻击：未命中${match[2]}`)}; }
+    return {enabled:true,real:confirmed && norm(r.requestBody)!=='',result:confirmed&&norm(r.requestBody)!==''?'真实攻击：告警结果已确认成功':'待确认：缺少可验证的 HTTP 请求载荷证据'};
+  }
+  function isRealAttack(r){ return threatTriage(r).real; }
+  function alertTag(r, showTriage){ return r.isSqlAlert?`<span class="tag err">SQL 告警</span>${showTriage?` <span class="tag ${r.sqli?'err':'ok'}">${r.sqli?'真实攻击':'未命中'}</span>`:''}`:''; }
+  function renderThreatFilters(){
+    rows.forEach(r=>{ r.threatType=repairMojibake(r.threatType)||'-'; r.alertName=repairMojibake(r.alertName)||'-'; });
+    const types=[...new Set(rows.map(r=>r.threatType).filter(t=>t&&t!=='-'))].sort((a,b)=>a.localeCompare(b,'zh-CN'));
+    $('threatFilters').innerHTML=types.length?`<div class="threat-filter-head"><span>按威胁类型筛选</span><span class="threat-filter-note">选择类型后可进一步限定真实攻击</span></div><div class="threat-grid">${types.map((type,i)=>{const id=`threat_${i}`; const realId=`real_threat_${i}`; const count=rows.filter(r=>r.threatType===type).length; const sql=/sql\s*(?:injection|注入)|sql注入/i.test(type); return `<div class="threat-card"><input id="${id}" class="threatTypeCheck" type="checkbox" data-type="${e(type)}" ${selectedThreatTypes.has(type)?'checked':''}/><label class="threat-name" for="${id}" title="${e(type)}">${e(type)}（${count}）${sql?' · SQL 研判':''}</label><label class="threat-real" for="${realId}"><input id="${realId}" class="realAttackTypeCheck" type="checkbox" data-type="${e(type)}" ${realAttackThreats.has(type)?'checked':''}/> 仅看真实攻击</label></div>`;}).join('')}</div>`:'<div class="empty">导入 CSV 后将按威胁类型生成筛选项。</div>';
+    document.querySelectorAll('.threatTypeCheck').forEach(el=>el.onchange=()=>{const type=el.dataset.type; el.checked?selectedThreatTypes.add(type):selectedThreatTypes.delete(type); if(!el.checked) realAttackThreats.delete(type); renderThreatFilters(); render();});
+    document.querySelectorAll('.realAttackTypeCheck').forEach(el=>el.onchange=()=>{const type=el.dataset.type; if(el.checked){realAttackThreats.add(type); selectedThreatTypes.add(type);}else realAttackThreats.delete(type); renderThreatFilters(); render();});
+  }
+  function filteredIndexes(){ const q=$('filter').value.trim().toLowerCase(); const abnormalResponseOnly=$('abnormalResponseOnly').checked; const missingBodyOnly=$('missingBodyOnly').checked; const allRealAttackOnly=$('allRealAttackOnly').checked; const occurDaysValues=$('occurDaysFilter').value.split(/[，,\/\s]+/).map(v=>v.trim()).filter(Boolean); const items=rows.map((r,i)=>({r,i})).filter(x=>{ const status=Number(x.r.status); const abnormal=status>=400&&status<=599; const typeSelected=selectedThreatTypes.size===0||selectedThreatTypes.has(x.r.threatType); const realOnly=realAttackThreats.has(x.r.threatType); const missingBody=!norm(x.r.requestBody); const occurDaysMatched=!occurDaysValues.length||occurDaysValues.includes(norm(x.r.occurDays)); return typeSelected&&(!realOnly||isRealAttack(x.r))&&(!allRealAttackOnly||isRealAttack(x.r))&&(!abnormalResponseOnly||abnormal)&&(!missingBodyOnly||missingBody)&&occurDaysMatched&&(!q||Object.values(x.r).join(' ').toLowerCase().includes(q)); }); const mode=$('sortBy').value; items.sort((a,b)=>{ if(mode==='time_asc') return String(a.r.time).localeCompare(String(b.r.time)); if(mode==='time_desc') return String(b.r.time).localeCompare(String(a.r.time)); if(mode==='threat') return String(a.r.threatType).localeCompare(String(b.r.threatType),'zh-CN'); if(mode==='alert') return String(a.r.alertName).localeCompare(String(b.r.alertName),'zh-CN'); return 0; }); return items; }
+  function displayProtocol(r){ return repairMojibake(r.appProtocol||r.host||r.method||'原始流量'); }
+  function render(){
+    const indexes=filteredIndexes();
+    $('records').innerHTML=indexes.length?indexes.map(({r,i})=>{ const triage=threatTriage(r); const triageTag=`<span class="tag ${triage.real?'err':'ok'}">${triage.real?'真实攻击':triage.result.includes('待确认')?'待确认':'非真实攻击'}</span>`; return `<div class="record ${active===i?'active':''}" data-i="${i}"><div class="line"><b>${e(r.isHttp?r.method:displayProtocol(r))} ${e(r.isHttp?(r.host||r.dstIp):'')}</b><span>${triageTag} ${tag(r)}</span></div><div class="line"><small><b>威胁类型：</b>${e(repairMojibake(r.threatType))}</small><small>${e(r.uri)}</small></div><div class="line"><small><b>告警名称：</b>${e(repairMojibake(r.alertName))}</small></div><div class="line"><small><b>源 IP：</b>${e(r.srcIp)}:${e(r.srcPort)} → ${e(r.dstIp)}:${e(r.dstPort)}</small></div></div>`; }).join(''):'<div class="empty">未找到匹配流量</div>';
+    document.querySelectorAll('.record').forEach(el=>el.onclick=()=>{active=+el.dataset.i;render();});
+    if(active>=0&&rows[active]) detail(rows[active]); else $('detail').innerHTML='<div class="empty">选择左侧记录后显示完整请求与响应内容。</div>';
+  }
+  function platformAssessment(r){ const raw=r.triageResult; const reason=r.triageReason; const platformIds=['73530ee8-31a3-4246-b3c0-6a40ce7ce538','00077ea9-8d98-40f4-a78b-cac9dbbddffe']; if(platformIds.includes(raw)||/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(raw)) return reason&&reason!=='-'?`平台研判：${reason}`:'平台研判：未提供可读研判结论（仅返回内部规则标识）'; return raw||'-'; }
+  function detail(r){ const result=threatTriage(r).result; const url=r.isHttp?(r.fullUrl||r.uri||'-'):'-'; const isReal=threatTriage(r).real; $('detail').innerHTML=`<div class="meta"><div><label>告警名称</label><code>${e(repairMojibake(r.alertName))}</code></div><div><label>威胁类型</label><code>${e(repairMojibake(r.threatType))}</code></div><div><label>应用协议</label><code>${e(repairMojibake(r.appProtocol|| (r.isHttp?'HTTP':'未知')))}</code></div><div><label>研判结果</label><code>${e(result)}</code></div><div><label>平台研判</label><code>${e(platformAssessment(r))}</code></div><div><label>告警出现天数</label><code>${e(r.occurDays||'-')}</code></div><div><label>请求 URL</label><code>${e(url)}</code></div><div><label>源 IP / 源端口</label><code>${e(r.srcIp)}:${e(r.srcPort)}</code></div><div><label>目的 IP / 目的端口</label><code>${e(r.dstIp)}:${e(r.dstPort)}</code></div><div><label>请求时间</label><code>${e(r.time)}</code></div></div><div class="sections">${isReal?'<div class="hint"><b style="color:#a71919">红色高亮为判定真实攻击的关键证据。</b></div>':''}<section class="block"><h3>${e(requestHeaderLabel(r))}</h3><pre>${evidenceHtml(repairMojibake(reqText(r)),r)}</pre></section><section class="block"><h3>${e(requestBodyLabel(r))}</h3><pre>${evidenceHtml(displayedRequestBody(r)||'(空)',r)}</pre></section><section class="block"><h3>响应码</h3><pre class="${responseCodeClass(r.status)}">${e(resText(r))}</pre></section><section class="block"><h3>${e(responseBodyLabel(r))}</h3><pre>${e(displayedPayload(r.responseBody)||'(空)')}</pre></section><section class="block"><h3>告警描述</h3><pre>${e(repairMojibake(r.alarmDescription))}</pre></section><section class="block"><h3>研判原因</h3><pre>${e(repairMojibake(r.triageReason))}</pre></section></div>`; }
+  function summary(){ const abnormalCount=rows.filter(r=>{ const status=Number(r.status); return status>=400&&status<=599; }).length; $('count').textContent=rows.length; $('sqliCount').textContent=rows.filter(r=>r.isSqlAlert).length; $('errors').textContent=abnormalCount; $('sources').textContent=new Set(rows.map(r=>r.srcIp)).size; $('export').disabled=!rows.length; }
+  function load(data){ rows=data.map(normalize).map(r=>({
+    ...r,
+    alertName:repairMojibake(r.alertName)||'-',
+    threatType:repairMojibake(r.threatType)||'-',
+    host:repairMojibake(r.host),
+    appProtocol:repairMojibake(r.appProtocol),
+    requestHeader:repairMojibake(r.requestHeader),
+    requestBody:repairMojibake(r.requestBody),
+    responseHeader:repairMojibake(r.responseHeader),
+    responseBody:repairMojibake(r.responseBody),
+    triageResult:repairMojibake(r.triageResult),
+    triageReason:repairMojibake(r.triageReason),
+    alarmDescription:repairMojibake(r.alarmDescription)
+  })); active=rows.length?0:-1; selectedThreatTypes.clear(); realAttackThreats.clear(); summary(); renderThreatFilters(); render(); }
+  $('file').onchange=async ev=>{ const file=ev.target.files[0]; if(!file)return; try { const isExcel=/\.(xls|xlsx)$/i.test(file.name); if(isExcel){ if(!window.XLSX) throw new Error('Excel 解析组件未加载，请检查网络后重试'); const workbook=XLSX.read(await file.arrayBuffer(),{type:'array'}); const firstSheet=workbook.Sheets[workbook.SheetNames[0]]; if(!firstSheet) throw new Error('未找到可分析的工作表'); const csv=XLSX.utils.sheet_to_csv(firstSheet); load(parseCSV(csv)); } else { load(await readCsvFile(file)); } } catch(err){ alert('文件导入失败：'+err.message); } finally { ev.target.value=''; } };
+  $('filter').oninput=render;
+  $('sortBy').onchange=render;
+  document.addEventListener('keydown', ev=>{ if(ev.key!=='ArrowUp'&&ev.key!=='ArrowDown') return; const target=ev.target; if(target && (target.tagName==='INPUT'||target.tagName==='TEXTAREA'||target.tagName==='SELECT'||target.isContentEditable)) return; const visible=filteredIndexes(); if(!visible.length) return; ev.preventDefault(); let position=visible.findIndex(item=>item.i===active); if(position<0) position=ev.key==='ArrowDown'?-1:0; position=ev.key==='ArrowDown'?Math.min(position+1,visible.length-1):Math.max(position-1,0); active=visible[position].i; render(); const selected=document.querySelector(`.record[data-i="${active}"]`); selected?.scrollIntoView({block:'nearest',behavior:'smooth'}); });
+  $('decodeBase64').onchange=()=>{ if(active>=0&&rows[active]) detail(rows[active]); };
+  $('abnormalResponseOnly').onchange=()=>{ $('abnormalMetric').classList.toggle('active',$('abnormalResponseOnly').checked); $('abnormalMetricHint').textContent=$('abnormalResponseOnly').checked?'已筛选异常响应':'点击筛选'; render(); };
+  $('abnormalMetric').onclick=()=>{ $('abnormalResponseOnly').checked=!$('abnormalResponseOnly').checked; $('abnormalResponseOnly').dispatchEvent(new Event('change')); };
+  $('missingBodyOnly').onchange=render;
+  $('occurDaysFilter').oninput=render;
+  $('allRealAttackOnly').onchange=render;
+  $('export').onclick=()=>{ const hs=['alert_name','src_ip','src_port','dst_ip','dst_port','method','host','uri','status','sql_alert','sqli_analysis','request_header','request_body','response_header']; const csv=[hs.join(','),...rows.map(r=>hs.map(k=>`"${String(r[{alert_name:'alertName',src_ip:'srcIp',src_port:'srcPort',dst_ip:'dstIp',dst_port:'dstPort',sql_alert:'isSqlAlert',sqli_analysis:'sqli',request_header:'requestHeader',request_body:'requestBody',response_header:'responseHeader'}[k]||k]||'').replace(/"/g,'""')}"`).join(','))].join('\r\n'); const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));a.download='http_traffic_analysis.csv';a.click();URL.revokeObjectURL(a.href); };
+})();
